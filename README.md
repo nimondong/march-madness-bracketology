@@ -2,7 +2,7 @@
 
 I’ve always been a pretty avid professional/college basketball fan, while also being interested in the application of data analytics in the sports world. 
 
-With the March Madness Tournament coming up this year, I wanted to apply the concepts we learned in STAT 301-2 Data Science II to try to predict the March Madness Tournament. Predicting the tournament comes down to predicting outcomes of college basketball games given historical performance statistics. Because the outcome of a basketball game is binary, i.e. win or lose, this is a classification problem. 
+Predicting the tournament comes down to predicting outcomes of college basketball games given historical performance statistics. Because the outcome of a basketball game is binary, i.e. win or lose, this is a classification problem. 
 
 Overall, this final report includes a practical application and assessment of the model methodologies I learned in class. I have also include a brief Exploratory Data Analysis (EDA) in the Appendix.
 
