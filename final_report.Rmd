@@ -1,0 +1,1040 @@
+---
+title: |
+  ![](images/logo.png){width=4in}  
+  
+  College Basketball Analytics: Predicting Outcomes of March Madness
+author: | 
+  Nimon Dong  
+  
+  STAT 301-2 Data Science II Final Project
+date: "3/15/2020"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    highlight: "tango"
+---
+
+***
+
+``` {r, message = FALSE, echo = FALSE}
+# Loading Packages
+library(tidyverse)
+library(readr)
+library(janitor)
+library(skimr)
+library(modelr)
+library(broom)
+library(leaps) # best subset selection
+library(glmnet) # ridge & lasso
+library(glmnetUtils) # improves working with glmnet
+library(pls) # pcr and pls
+library(GGally)
+library(knitr)
+library(MASS)
+library(kableExtra)
+library(corrplot)
+library(class)
+library(DT)
+library(png)
+library(grid)
+
+select <- dplyr::select
+```
+
+# Introduction
+
+I’ve always been a pretty avid professional/college basketball fan, while also being interested in the application of data analytics in the sports world. With the March Madness Tournament coming up this year, I wanted to apply the concepts we learned in STAT 301-2 Data Science II to try to predict the March Madness Tournament. Predicting the tournament comes down to predicting outcomes of college basketball games given historical performance statistics. Because the outcome of a basketball game is binary, i.e. win or lose, this is a classification problem. Overall, this final report includes a practical application and assessment of the model methodologies I learned in class. I have also include a brief Exploratory Data Analysis (EDA) in the Appendix. 
+
+### Data
+
+For training and testing my regression models, I used datasets from a 2020 Google Cloud & NCAA ML Competition on Kaggle.com. These datasets include extensive historical data from D1 college basketball teams from 2003-2019 (366 teams and over 80,000 basketball games). Taken together, these datasets cover important player game performance metrics on each team, past tournaments, regular season results, etc. Given the nature of these datasets, there is no missingness. These performance metrics are as follows:
+
+* FGM - field goals made 
+* FGA - field goals attempted 
+* FGM3 - three pointers made 
+* FGA3 - three pointers attempted 
+* FTM - free throws made
+* FTA - free throws attempted
+* OR - offensive rebounds
+* DR - defensive rebounds 
+* Ast - assists 
+* TO - turnovers committed 
+* Stl - steals 
+* Blk - blocks 
+* PF - personal fouls committed 
+
+The formal citation is as follows:
+
+Kaggle.com “Google Cloud & NCAA® ML Competition 2020-Men’s Dataset” Available online at: https://www.kaggle.com/c/google-cloud-ncaa-march-madness-2020-division-1-mens-tournament/data
+
+<center>
+![](images/kaggle.png){width=4in} 
+</center>
+
+### Data Cleaning 
+
+First, I started with the dataset containing detained regular season game results. Using this dataset, I calculated end of regular season average statistics for each team for each season. These statistics are all continuous variables. Below is a codebook defining and describing statistics I chose:
+
+* seed - Tournament Seed
+* win_pct - Win Percentage
+* pos - Possessions
+* opp_pos - Opponent Possessions
+* pace - Pace (Average Possessions Per Game)
+* efg_pct - Effective Field Goal Percentage 
+* ts_percent - True Shooting Percent
+* r3P - 3-point Attempt Rate
+* or_pct - Offensive Rebounding Percentage 
+* dr_pct - Defensive Rebounding Percentage 
+* trb_pct - Total Rebound Percentage
+* ast_pct - Assist Percentage
+* stl_pct - Steal Percentage
+* to_pct - Turnover Percentage 
+* blk_pct - Block Percentage
+* ftr - Free Throw Rate 
+* ORtg - Offensive Rating
+* DRtg - Defensive Rating
+
+Then, I took the historical tournament results and, for each tournament matchup, appended the first team's regular season statistics, their opponents (team 2) regular season statistics, and the difference between each statistic. In addition, I created the reverse matchup for each game, resulting in the data frame outlined below:   
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+x <- data.frame("Win" = c(1,0), 
+           "Team_1" = c("Team A", "Team B"), 
+           "Team_2" = c("Team B","Team A"), 
+           "Team_1_Regular_Season_Stats" = c("Team A regular season stats. . .", "Team B regular season stats. . ."),
+           "Team_2_Regular_Season_Stats" = c("Team B regular season stats. . .", "Team A regular season stats. . ."),
+           "Stats_Differential" = c("Team A - Team B stats. . .", "Team B - Team A stats. . ."))
+
+x %>%
+  kable() %>%
+  kable_styling()
+```
+
+Overall, my final cleaned dataset had 48 predictors with 2,230 observations. It is important to note that multicollinearity does exist where some of my predictor variables are correlated with each other. With this in mind, I took a deeper dive into resolving this issue in the Modeling Fitting section of this final report.
+
+### Data Splitting
+
+For my project, I first split my cleaned data into one set with regular season statistics and another set with only the statistic differentials. Given that the statistic differentials are derived from regular season statistics, this dataset separation partially resolved the multicollinearity issues between these two sets of predictors.
+
+In order to split each dataset into training and test datasets, I used two different resampling methods depending on the model I ran. Yes, it is more optimal to train and test each model using the same sampling method; however, I wanted to apply a variety of different resampling methods we learned in the class. In the first resampling method, I used a validation set approach where I set aside the 2019 season as a test set and used the 2003 - 2018 season as the training set. The second method I used was a 10-fold cross-validation approach - this approach involves randomly dividing the set of observations into 10 groups, or folds, of approximately equal size. The first fold is treated as a validation set, and the model is fit on the remaining 9 folds.
+
+***
+
+# Model Fitting
+
+``` {r, message = FALSE, echo = FALSE}
+# Load Dataset ------------------------------------------------------------
+
+model_data <- read_csv("data/cleaned_data.csv") %>%
+  select(-team_1_name, -team_2_name) %>%
+  select(1:36)
+
+# 33 Predictors
+
+model_data_diff <- read_csv("data/cleaned_data.csv") %>%
+  select(-team_1_name, -team_2_name) %>%
+  select(season, team_1, team_2, win, 37:52) 
+
+# 16 Predictors
+
+# Setting Seed ------------------------------------------------------------
+
+set.seed(3)
+
+# Helper Functions --------------------------------------------------------
+
+# Get predicted values using regsubset object
+predict_regsubset <- function(object, fmla , new_data, model_id)
+{
+  # Not a dataframe? -- handle resample objects/k-folds
+  if(!is.data.frame(new_data)){
+    new_data <- as_tibble(new_data)
+  }
+  
+  # Get formula
+  obj_formula <- as.formula(fmla)
+  
+  # Extract coefficients for desired model
+  coef_vector <- coef(object, model_id)
+  
+  # Get appropriate feature matrix for new_data
+  x_vars <- names(coef_vector)
+  mod_mat_new <- model.matrix(obj_formula, new_data)[ , x_vars]
+  
+  # Get predicted values
+  pred <- as.numeric(mod_mat_new %*% coef_vector)
+  
+  return(pred)
+}
+
+# Calculate test MSE on regsubset objects
+test_mse_regsubset <- function(object, fmla , test_data){
+  
+  # Number of models
+  num_models <- object %>% summary() %>% pluck("which") %>% dim() %>% .[1]
+  
+  # Set up storage
+  test_mse <- rep(NA, num_models)
+  
+  # observed targets
+  obs_target <- test_data %>% 
+    as_tibble() %>% 
+    pull(!!as.formula(fmla)[[2]])
+  
+  # Calculate test MSE for each model class
+  for(i in 1:num_models){
+    pred <- predict_regsubset(object, fmla, test_data, model_id = i)
+    test_mse[i] <- mean((obs_target - pred)^2)
+  }
+  
+  # Return the test errors for each model class
+  tibble(model_index = 1:num_models,
+         test_mse    = test_mse)
+}
+
+# Function to calculate error rate
+error_rate_glm <- function(data, model){
+  data %>% 
+    mutate(pred_prob = predict(model, newdata = data, type = "response"),
+           pred_win = if_else(pred_prob > 0.5, 1, 0),
+           error = pred_win != win) %>% 
+    pull(error) %>% 
+    mean()
+}
+
+error_rate_lda <- function(data, model){
+  data %>%
+    mutate(pred_win = predict(model, newdata = data) %>%
+             pluck("class"),
+           error = pred_win != win) %>%
+    pull(error) %>%
+    mean()
+}
+
+confusion_mat_lda <- function(data, model){
+  data %>%
+    mutate(pred_win = predict(model, newdata = data) %>%
+             pluck("class")) %>%
+    count(win, pred_win) %>%
+    mutate(prop = n / sum(n))
+}
+
+# calculating error rate
+error_rate_qda <- function(data, model){
+  data %>%
+    mutate(pred_win = predict(model, newdata = data) %>%
+             pluck("class"),
+           error = pred_win != win) %>%
+    pull(error) %>%
+    mean()
+}
+
+# generating confusion matrix
+confusion_mat_qda <- function(data, model){
+  data %>%
+    mutate(pred_win = predict(model, newdata = data) %>%
+             pluck("class")) %>%
+    count(win, pred_win) %>%
+    mutate(prop = n / sum(n))
+}
+
+knn_tidy <- function(train, test, pred_vars, response_var, ...){
+  train_reduced <- train %>% select(!!pred_vars) %>% as.matrix()
+  test_reduced  <- test %>% select(!!pred_vars) %>% as.matrix()
+  train_class   <- train %>% select(!!response_var) %>% as.matrix()
+  
+  preds <- class::knn(train = train_reduced, 
+                      test = test_reduced, 
+                      cl = train_class, ...) 
+  
+  pred_name <- paste0("pred_", response_var)
+  tibble(!!pred_name := preds)
+}
+
+# calculating error rate
+error_rate_knn <- function(data, pred_value){
+  data %>%
+    bind_cols(pred_value) %>%
+    mutate(error = win != pred_win) %>%
+    pull(error) %>%
+    mean()
+}
+
+# confusion matrix
+confusion_mat_knn <- function(data, pred_value){
+  data %>%
+    bind_cols(pred_value) %>% 
+    count(win, pred_win) %>% 
+    mutate(prop = n / sum(n))
+}
+
+
+# Splitting Dataset: Training / Test --------------------------------------
+test_data <- model_data %>% filter(season == 2019)
+train_data <- model_data %>% setdiff(test_data)
+
+test_data_diff <- model_data_diff %>% filter(season == 2019)
+train_data_diff <- model_data_diff %>% setdiff(test_data_diff)
+```
+
+### Subset Selection Methods
+
+First, I used tidyverse techniques and methods to develop linear models and conduct feature selection. Feature selection is advantageous because it: 1) Keep it Simple Stupid (KISS), 2) corrects multicollinearity issues, and 3) reduces overfitting. Feature selection can be accomplished via a couple different methods, mainly: Best Subset Selection, Forward Stepwise Selection, and Backward Stepwise Selection.
+
+#### Best Subset Selection
+Best subset selection is not optimal because there is large number of predictors in my dataset. As search space increases, the chance of finding models that fit the the training data well also increase. However, these models might not have any predictive power on future data! This method tends to lead to overfitting and high variance of the coefficient estimates. Instead, I used stepwise selection methods as they are much more restrictive and thus a more attractive alternative to best subset selection.
+
+#### Forward Stepwise Selection & Backward Stepwise Selection
+
+##### Non-differential Regular Season Statistics
+
+First, I ran a forward stepwise selection on all non-differential regular season statistics. 
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+fwd_cv <- train_data %>%
+  crossv_kfold(10, id = "folds") %>%
+  mutate(fmla = "win ~ . -season -team_1 -team_2",
+         model_fits = map2(fmla, train, ~ regsubsets(as.formula(.x), data = .y, nvmax = 33, method = "forward")),
+         model_fold_mse = pmap(list(model_fits, fmla ,test), test_mse_regsubset))
+```
+
+<div class = "row">
+<div class = "col-md-4">
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Plot test MSE (forward search)
+x <- fwd_cv %>% 
+  unnest(model_fold_mse) %>% 
+  group_by(model_index) %>%  
+  summarise(test_mse = mean(test_mse)) %>% 
+  arrange(test_mse) %>%
+  mutate_if(is.numeric, round, digits = 4)
+
+datatable(x, rownames = FALSE, filter="top", options = list(pageLength = 5, scrollX=T))
+```
+
+</div>
+<div class = "col-md-8">
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+fwd_cv %>%
+  unnest(model_fold_mse) %>% 
+  group_by(model_index) %>% 
+  summarise(test_mse = mean(test_mse)) %>% 
+  ggplot(aes(model_index, test_mse)) + 
+  geom_line()
+
+# Choose 18 predictors
+```
+</div>
+</div>
+
+Looking at the test MSE, even though the forward selection method suggested a model with 23 predictors, I chose the model with 18 predictors because the difference in test MSE is marginal and I wanted to keep the model as simple as possible.
+
+Next, I ran a backward stepwise selection on all non-differential regular season statistics.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+back_cv <- train_data %>%
+  crossv_kfold(10, id = "folds") %>%
+  mutate(fmla = "win ~ . -season -team_1 -team_2",
+         model_fits = map2(fmla, train, ~ regsubsets(as.formula(.x), data = .y, nvmax = 33, method = "backward")),
+         model_fold_mse = pmap(list(model_fits, fmla ,test), test_mse_regsubset))
+```
+
+<div class = "row">
+<div class = "col-md-4">
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Plot test MSE (backward search)
+x <- back_cv %>% 
+  unnest(model_fold_mse) %>% 
+  group_by(model_index) %>%  
+  summarise(test_mse = mean(test_mse)) %>% 
+  arrange(test_mse) %>%
+  mutate_if(is.numeric, round, digits = 4)
+
+datatable(x, rownames = FALSE, filter="top", options = list(pageLength = 5, scrollX=T))
+```
+
+</div>
+<div class = "col-md-8">
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+back_cv %>%
+  unnest(model_fold_mse) %>% 
+  group_by(model_index) %>% 
+  summarise(test_mse = mean(test_mse)) %>% 
+  ggplot(aes(model_index, test_mse)) + 
+  geom_line()
+```
+</div>
+</div>
+
+Looking at the test MSE, even though the backward selection method suggested a model with 31 predictors, I chose the model with 16 predictors because, again, the difference in test MSE is marginal and I wanted to keep the model as simple as possible.
+
+I then implemented each selection method on the entire training dataset, extracted the best model that uses the indicated number of predictors, and inspected the stepwise model coefficients.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Inspecting Stepwise Model Coefficients
+model_regsubsets <- tibble(train = train_data %>% list(),
+                           test = test_data %>% list())
+
+model_regsubsets <- model_regsubsets %>%
+  mutate(fwd_selection = map(train, ~ regsubsets(win ~ . -season -team_1 -team_2,
+                                                 data = .x, nvmax = 33,
+                                                 method = "forward")),
+         back_selection = map(train, ~ regsubsets(win ~ . -season -team_1 -team_2,
+                                                  data = .x, nvmax = 33,
+                                                  method = "backward"))) %>%
+  pivot_longer(cols = c(-test, -train), names_to = "method", values_to = "fit")
+
+model_regsubsets %>% 
+  pluck("fit") %>% 
+  map2(c(18, 16), ~ coef(.x, id = .y)) %>% 
+  map2(c("fwd", "back"), ~ enframe(.x, value = .y)) %>% 
+  reduce(full_join) %>%
+  kable(digits = 4) %>%
+  kable_styling()
+```
+
+Finally, I compared the test errors.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+regsubset_error <- model_regsubsets %>% 
+  mutate(test_mse = map2(fit, test, ~ test_mse_regsubset(.x, win ~ . -season -team_1 -team_2, .y))) %>% 
+  unnest(test_mse) %>% 
+  group_by(method) %>% 
+  filter(model_index == max(model_index)) %>% 
+  select(method, test_mse) %>% 
+  ungroup() %>%
+  arrange(test_mse)
+
+regsubset_error %>%
+  kable() %>%
+  kable_styling()
+```
+
+***
+
+##### Differential Regular Season Statistics
+
+Next, I ran a forward stepwise selection on all differential regular season statistics. 
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+fwd_cv_diff <- train_data_diff %>%
+  crossv_kfold(10, id = "folds") %>%
+  mutate(fmla = "win ~ . -season -team_1 -team_2",
+         model_fits = map2(fmla, train, ~ regsubsets(as.formula(.x), data = .y, nvmax = 16, method = "forward")),
+         model_fold_mse = pmap(list(model_fits, fmla ,test), test_mse_regsubset))
+```
+
+<div class = "row">
+<div class = "col-md-4">
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Plot test MSE (forward search)
+x <- fwd_cv_diff %>% 
+  unnest(model_fold_mse) %>% 
+  group_by(model_index) %>%  
+  summarise(test_mse = mean(test_mse)) %>% 
+  arrange(test_mse) %>%
+  mutate_if(is.numeric, round, digits = 4)
+
+datatable(x, rownames = FALSE, filter="top", options = list(pageLength = 5, scrollX=T))
+```
+
+</div>
+<div class = "col-md-8">
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+fwd_cv_diff %>%
+  unnest(model_fold_mse) %>% 
+  group_by(model_index) %>% 
+  summarise(test_mse = mean(test_mse)) %>% 
+  ggplot(aes(model_index, test_mse)) + 
+  geom_line()
+```
+</div>
+</div>
+
+Looking at the test MSE, it seemed like the forward selection method suggested a model with 10 predictors.
+
+I then ran a backward stepwise selection on all non-differential regular season statistics.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+back_cv_diff <- train_data_diff %>%
+  crossv_kfold(10, id = "folds") %>%
+  mutate(fmla = "win ~ . -season -team_1 -team_2",
+         model_fits = map2(fmla, train, ~ regsubsets(as.formula(.x), data = .y, nvmax = 16, method = "backward")),
+         model_fold_mse = pmap(list(model_fits, fmla ,test), test_mse_regsubset))
+```
+
+<div class = "row">
+<div class = "col-md-4">
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Plot test MSE (backward search)
+x <- back_cv_diff %>% 
+  unnest(model_fold_mse) %>% 
+  group_by(model_index) %>%  
+  summarise(test_mse = mean(test_mse)) %>% 
+  arrange(test_mse) %>%
+  mutate_if(is.numeric, round, digits = 4)
+
+datatable(x, rownames = FALSE, filter="top", options = list(pageLength = 5, scrollX=T))
+```
+
+</div>
+<div class = "col-md-8">
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+back_cv_diff %>%
+  unnest(model_fold_mse) %>% 
+  group_by(model_index) %>% 
+  summarise(test_mse = mean(test_mse)) %>% 
+  ggplot(aes(model_index, test_mse)) + 
+  geom_line()
+```
+</div>
+</div>
+
+Looking at the test MSE, it seemed like the backward selection method is suggested a model with 13 predictors.
+
+I implemented each selection method on the entire training dataset, extracted the best model that uses the indicated number of predictors, and inspected the stepwise model coefficients.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Inspecting Stepwise Model Coefficients
+model_regsubsets_diff <- tibble(train = train_data_diff  %>% list(),
+                                test = test_data_diff  %>% list())
+
+model_regsubsets_diff  <- model_regsubsets_diff  %>%
+  mutate(fwd_selection_diff = map(train, ~ regsubsets(win ~ . -season -team_1 -team_2,
+                                                      data = .x, nvmax = 16,
+                                                      method = "forward")),
+         back_selection_diff = map(train, ~ regsubsets(win ~ . -season -team_1 -team_2,
+                                                       data = .x, nvmax = 16,
+                                                       method = "backward"))) %>%
+  pivot_longer(cols = c(-test, -train), names_to = "method", values_to = "fit")
+
+model_regsubsets_diff  %>% 
+  pluck("fit") %>% 
+  map2(c(10, 13), ~ coef(.x, id = .y)) %>% 
+  map2(c("fwd", "back"), ~ enframe(.x, value = .y)) %>% 
+  reduce(full_join) %>%
+  kable(digits = 4) %>%
+  kable_styling()
+```
+
+Finally, I compared the test errors.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+regsubset_error_diff  <- model_regsubsets_diff  %>% 
+  mutate(test_mse = map2(fit, test, ~ test_mse_regsubset(.x, win ~ . -season -team_1 -team_2, .y))) %>% 
+  unnest(test_mse) %>% 
+  group_by(method) %>% 
+  filter(model_index == max(model_index)) %>% 
+  select(method, test_mse) %>% 
+  ungroup() %>%
+  arrange(test_mse)
+
+regsubset_error_diff %>%
+  kable() %>%
+  kable_styling()
+```
+
+The test errors from both non-differential statistics and differential statistics are pretty much the same. This means that when picking the best model, I would select the model chosen by the forward selection method on the differential statistics dataset as this model would have least number of predictors involved. Because the differential statistics were derived from the non-differential statistics, it seemed like these differential statistics baked in all the necessary predicting information and reduced the number of overall features. In the following models, I used the differential statistics dataset exclusively.  
+
+***
+
+### Logistic Regression
+
+Next, I fit a logistic model. Overall, I ran five different logistic regressions using a 10-k fold cross-validation method. I picked predictor combinations based off the features chosen by the forward stepwise selection on the differential statistics I ran above. The formulae are as follows:
+
+1. win ~ diff_seed
+2. win ~ diff_ORtg + diff_DRtg
+3. win ~ diff_ORtg + diff_DRtg + diff_seed
+4. win ~ diff_efg_pct + diff_to_pct + diff_or_pct + diff_ftr
+5. win ~ diff_seed + diff_win_pct + diff_pace + diff_ts_pct + diff_or_pct + diff_ast_pct + diff_stl_pct + diff_ftr + diff_ORtg + diff_DRtg
+
+The test errors from each model are shown below.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Taking out non-regression columns
+model_data_diff <- model_data_diff %>%
+  select(-season, -team_1, -team_2)
+
+# Setting up formulas
+fmla <- c(
+  "win ~ diff_seed",
+  "win ~ diff_ORtg + diff_DRtg",
+  "win ~ diff_ORtg + diff_DRtg + diff_seed",
+  "win ~ diff_efg_pct + diff_to_pct + diff_or_pct + diff_ftr",
+  "win ~ diff_seed + diff_win_pct + diff_pace + diff_ts_pct + diff_or_pct + diff_ast_pct + diff_stl_pct + diff_ftr + diff_ORtg + diff_DRtg"
+) %>% map(as.formula)
+ 
+model_setup <- tibble(model_name = str_c("log_mod_", seq_along(fmla)),
+                      fmla = fmla)
+
+# Adding k-fold and model setup
+model_10fold <- model_data_diff %>%
+  crossv_kfold(10, id = "fold") %>%
+  mutate(train = map(train, as_tibble),
+         test = map(test, as_tibble)) %>%
+  crossing(model_setup)
+
+
+# Adding model fit and assessment
+glm_10fold <- model_10fold %>%
+  mutate(model_fit = map2(fmla, train, glm, family = "binomial"),
+         fold_error = map2_dbl(test, model_fit, error_rate_glm))
+
+# Assessing error rates
+glm_10fold_error <- glm_10fold %>%
+  group_by(model_name) %>%
+  summarise(test_error = mean(fold_error)) %>%
+  rename(method = model_name,
+         test_mse = test_error) %>%
+  arrange(test_mse)
+
+glm_10fold_error %>%
+  kable() %>%
+  kable_styling()
+```
+
+Looking at the test errors, model 3 seemed to be the best logistic model. This is surprising, given that this model reduced the number of features to just three, in particular, Offensive Rating Differential, Defensive Rating Differential, and Seed Difference. The model also did not include all the predictors chosen by the forward stepwise selection method.
+
+***
+
+### Linear Discriminant Analysis
+
+Here, I conducted a linear discriminant analysis. I ran the same five different regression predictor combinations from the logistic regression above, but used a validation set approach instead. The test errors from each model are shown below.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+tib_diff <- tibble(test = list(test_data_diff),
+                   train = list(train_data_diff))
+
+lda_fits <- tib_diff %>% 
+  mutate(lda_mod_1 = map(train, ~ lda(formula = win ~ diff_seed,
+                                      data = .x)),
+         lda_mod_2 = map(train, ~ lda(formula = win ~ diff_ORtg + diff_DRtg,
+                                      data = .x)),
+         lda_mod_3 = map(train, ~ lda(formula = win ~ diff_ORtg + diff_DRtg + diff_seed,
+                                      data = .x)),
+         lda_mod_4 = map(train, ~ lda(formula = win ~ diff_efg_pct + diff_to_pct + diff_or_pct + diff_ftr,
+                                      data = .x)),
+         lda_mod_5 = map(train, ~ lda(formula = win ~ diff_seed + diff_win_pct + diff_pace + diff_ts_pct + diff_or_pct + diff_ast_pct + diff_stl_pct + diff_ftr + diff_ORtg + diff_DRtg,
+                                      data = .x))) %>% 
+  pivot_longer(cols = contains("mod_"), names_to = "model_name", values_to = "model_fit")
+
+lda_fits <- lda_fits %>%
+  mutate(train_error = map2_dbl(train, model_fit, error_rate_lda), 
+         test_error = map2_dbl(test, model_fit, error_rate_lda), 
+         test_confusion = map2(test, model_fit, confusion_mat_lda))
+
+lda_fits_error <- lda_fits %>%
+  select(model_name, test_error) %>%
+  rename(method = model_name,
+         test_mse = test_error) %>%
+  arrange(test_mse)
+
+lda_fits_error %>%
+  kable() %>%
+  kable_styling()
+```
+
+Looking at the test errors, model 5 seemed to be the best LDA model. Aside from model 5, the test errors for the LDA models seemed to a bit higher compared to the logistic models. This difference may have resulted from the fact that LDA is quite sensitive to outliers and/or some predictors are non-normal. 
+
+***
+
+### Quadratic Discriminant Analysis
+
+I then conducted a quadratic discriminant analysis. Again, I ran the same five regression predictor combinations from the logistic regression and used a validation set approach. The test errors from each model are shown below.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+qda_fits <- tib_diff %>% 
+  mutate(qda_mod_1 = map(train, ~ qda(formula = win ~ diff_seed,
+                                       data = .x)),
+         qda_mod_2 = map(train, ~ qda(formula = win ~ diff_ORtg + diff_DRtg,
+                                       data = .x)),
+         qda_mod_3 = map(train, ~ qda(formula = win ~ diff_ORtg + diff_DRtg + diff_seed,
+                                       data = .x)),
+         qda_mod_4 = map(train, ~ qda(formula = win ~ diff_efg_pct + diff_to_pct + diff_or_pct + diff_ftr,
+                                       data = .x)),
+         qda_mod_5 = map(train, ~ qda(formula = win ~ diff_seed + diff_win_pct + diff_pace + diff_ts_pct + diff_or_pct + diff_ast_pct + diff_stl_pct + diff_ftr + diff_ORtg + diff_DRtg,
+                                       data = .x))) %>% 
+  pivot_longer(cols = contains("mod_"), names_to = "model_name", values_to = "model_fit")
+
+qda_fits <- qda_fits %>%
+  mutate(train_error = map2_dbl(train, model_fit, error_rate_qda),
+         test_error  = map2_dbl(test, model_fit, error_rate_qda),
+         test_confusion = map2(test, model_fit, confusion_mat_qda))  
+
+qda_fits_error <- qda_fits %>%
+  select(model_name, test_error) %>%
+  rename(method = model_name,
+         test_mse = test_error) %>%
+  arrange(test_mse)
+
+qda_fits_error %>%
+  kable() %>%
+  kable_styling()
+```
+
+Looking at the test errors, model 5 seemed to be again the best model. Interestingly, the QDA models I ran had about the same level of test errors as the LDA models. 
+
+***
+
+### K-Nearest Neighbors
+
+In addition, I conducted KNN. Again, I ran the same five regression predictor combinations from the logistic regression and used a validation set approach. The test errors from each model are shown below. Note, the model naming syntax is "model_pred_count_k_value".
+
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Set-up tibble with predictor variables
+pred_var <- tibble(pred_set = list(c("diff_seed"), 
+                                   c("diff_ORtg", "diff_DRtg"),
+                                   c("diff_ORtg", "diff_DRtg", "diff_seed"),
+                                   c("diff_efg_pct", "diff_to_pct", "diff_or_pct", "diff_ftr"),
+                                   c("diff_seed", "diff_win_pct", "diff_pace", "diff_ts_pct", "diff_or_pct", "diff_ast_pct", 'diff_stl_pct', "diff_ftr", "diff_ORtg", "diff_DRtg")))
+
+# Set-up tibble with num of neighbors (k)
+k_values <- tibble(k_value = c(1, 5, 10, 15))
+
+# Set-up tibble with model fitting info & fit to test dataset
+knn_fits <- tib_diff %>% 
+  crossing(k_values) %>% 
+  crossing(pred_var) %>% 
+  mutate(knn_preds = pmap(list(train, test, pred_set,"win", k_value),
+                          knn_tidy))
+
+# Update knn_fits with error and confusion info
+knn_fits <- knn_fits %>% 
+  mutate(test_error = map2_dbl(test, knn_preds, error_rate_knn),
+         test_confusion = map2(test, knn_preds, confusion_mat_knn))
+
+knn_fits_error <- knn_fits %>% 
+  select(pred_set, k_value, test_error) %>% 
+  arrange(test_error) %>%
+  mutate(pred_count = 1 + str_count(pred_set, pattern = " "),
+         method = paste0("knn_mod_", as.character(pred_count), "_", as.character(k_value))) %>%
+  select(method, test_error) %>%
+  rename(test_mse = test_error)
+
+knn_fits_error %>%
+  kable() %>%
+  kable_styling()
+```
+
+Looking at the test errors, model_3_5 seemed to be the best KNN model. This model used three predictors and a k-value of 5. 
+
+***
+
+### Ridge Regression & the Lasso
+
+I then ran a ridge regression and lasso models on the dataset. Below are plots displaying the 200 estimated test MSE values using 10 fold cross-validation for both ridge (left) and lasso models (right).
+
+``` {r out.width=c('50%', '50%'), fig.show='hold', message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+model_data_diff <- read_csv("data/cleaned_data.csv") %>%
+  select(-team_1_name, -team_2_name) %>%
+  select(season, team_1, team_2, win, 37:52) 
+
+# Defining training and test set
+
+test_data <- model_data_diff %>% filter(season == 2019)
+train_data <- model_data_diff %>% setdiff(test_data_diff)
+
+# Ridge Regression
+
+lambda_grid <- 10^seq(-2, 10, length = 200)
+
+ridge_cv <- train_data %>% 
+  cv.glmnet(
+    formula = win ~ . -season -team_1 -team_2 -team_1_name -team_2_name, 
+    data = ., 
+    alpha = 0, 
+    nfolds = 10,
+    lambda = lambda_grid
+  )
+
+plot(ridge_cv)
+
+# Lasso
+lasso_cv <- train_data %>% 
+  cv.glmnet(
+    formula = win ~ . -season -team_1 -team_2 -team_1_name -team_2_name,  
+    data = ., 
+    alpha = 1, 
+    nfolds = 10
+  )
+
+plot(lasso_cv)
+```
+
+When looking for the optimal $\lambda$, I looked for the $\lambda$ that minimized test error. I also looked at a $\lambda$ within one standard error from the minimized test error to safe guard against over-fitting issues. The coefficients for the candidate models produced by ridge regression and the lasso model are as follows:
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+ridge_lambda_min <- ridge_cv$lambda.min
+ridge_lambda_1se <- ridge_cv$lambda.1se
+
+lasso_lambda_1se <- lasso_cv$lambda.1se
+lasso_lambda_min <- lasso_cv$lambda.min
+
+model_glmnet <- tibble(
+  train = train_data_diff %>% list(),
+  test  = test_data_diff %>% list()
+  ) %>%
+  mutate(
+    ridge_min = map(train, ~ glmnet(win ~ . -season -team_1 -team_2, data = .x,
+                                    alpha = 0, lambda = ridge_lambda_min)),
+    ridge_1se = map(train, ~ glmnet(win ~ . -season -team_1 -team_2, data = .x,
+                                    alpha = 0, lambda = ridge_lambda_1se)),
+    lasso_min = map(train, ~ glmnet(win ~ . -season -team_1 -team_2, data = .x,
+                                    alpha = 1, lambda = lasso_lambda_min)),
+    lasso_1se = map(train, ~ glmnet(win ~ . -season -team_1 -team_2, data = .x,
+                                    alpha = 1, lambda = lasso_lambda_1se))
+    ) %>% 
+  pivot_longer(cols = c(-test, -train), names_to = "method", values_to = "fit")
+
+model_glmnet %>% 
+  pluck("fit") %>% 
+  map( ~ coef(.x) %>% 
+         as.matrix() %>% 
+         as.data.frame() %>% 
+         rownames_to_column("name")) %>%
+  reduce(full_join, by = "name") %>% 
+  mutate_if(is.double, ~ if_else(. == 0, NA_real_, .)) %>% 
+  rename(ridge_min = s0.x,
+         ridge_1se = s0.y,
+         lasso_min = s0.x.x,
+         lasso_1se = s0.y.y) %>% 
+  knitr::kable(digits = 3) %>%
+  kable_styling()
+```
+
+The test errors for the ridge regression and lasso are show below:
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+glmnet_error <- model_glmnet %>% 
+  mutate(pred = map2(fit, test, predict),
+         test_mse = map2_dbl(test, pred, ~ mean((.x$win - .y)^2))) %>% 
+  unnest(test_mse) %>% 
+  select(method, test_mse)
+
+glmnet_error %>%
+  kable() %>%
+  kable_styling()
+```
+
+
+***
+
+### PCR & PLS Regression
+
+Finally, I ran a PCR and PLS regression on our dataset. Below are plots of mean squared error by component for both PCR (left) and PLS regressions (right). I did this to identify the optimal number of principal components, shown by vertical line. The optimal number of principal components are 12 and 4 for the PCR and PLS regressions, respectively.
+
+
+
+``` {r out.width=c('50%', '50%'), fig.show='hold', message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# PCR Model
+pcr_cv <- train_data_diff %>% 
+  pcr(win ~ . -season -team_1 -team_2, data = ., scale = TRUE, validation = "CV")
+
+validationplot(pcr_cv, val.type="MSEP")
+abline(v = 12)
+
+# PLS Model
+pls_cv <- train_data_diff %>% 
+  plsr(win ~ . -season -team_1 -team_2, data = ., scale = TRUE, validation = "CV")
+
+validationplot(pls_cv, val.type="MSEP")
+abline(v = 4)
+```
+
+The test errors for the PCR and PLS regressions are show below:
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# fitting final pcr and pls models
+dim_reduct <- tibble(train = train_data_diff %>% list(),
+                     test  = test_data_diff %>% list()) %>%
+  mutate(pcr_12m = map(train, ~ pcr(win ~ . -season -team_1 -team_2, data = .x, ncomp = 12)),
+         pls_4m = map(train, ~ plsr(win ~ . -season -team_1 -team_2, data = .x, ncomp = 4))) %>%
+  pivot_longer(cols = c(-test, -train), names_to = "method", values_to = "fit")
+
+# Test errors
+dim_reduce_error <- dim_reduct %>% 
+  mutate(pred = pmap(list(fit, test, c(12, 4)), predict),
+         test_mse = map2_dbl(test, pred, ~ mean((.x$win - .y)^2))) %>% 
+  unnest(test_mse)  %>% 
+  select(method, test_mse)
+
+dim_reduce_error %>%
+  kable() %>%
+  kable_styling()
+```
+
+***
+
+### Comparing All Model Test Errors
+
+After, running these models on the training and test dataset, I compared the test errors across all models. The comparison is shown in the table below.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+x <- regsubset_error %>% 
+  bind_rows(regsubset_error_diff) %>%
+  bind_rows(glm_10fold_error) %>% 
+  bind_rows(lda_fits_error) %>% 
+  bind_rows(qda_fits_error) %>% 
+  bind_rows(knn_fits_error) %>% 
+  bind_rows(glmnet_error) %>% 
+  bind_rows(dim_reduce_error) %>% 
+  arrange(test_mse) %>%
+  mutate_if(is.numeric, round, digits = 4)
+
+datatable(x, rownames = FALSE, filter="top", options = list(pageLength = 10, scrollX=T))
+```
+
+Out of all the models I ran, the PCR model with 12 principal components was the best model with a test error of 0.1674. The ridge and lasso models came in at a close second and third, respectively. On the other end, the KNN models I ran, in general, performed the worst (i.e. had the highest test errors).
+
+***
+
+# Debrief and Next Steps
+
+### Areas of Improvement
+
+In order to increase overall model performance, I identified a couple areas of future improvement. Foremost, I would like to include more types of predictors to begin with. In this project, I only accounted for regular season game team statistics not from the tournament itself. This exclusion in itself may present a strong omitted variable bias because, compared to regular season games, tournament games are usually more intense and their intensity increases as the overall tournament progresses. This intensity may lead to an increase or decrease in player / team performance. 
+
+I would also like to transform each regular season statistics (square, square root, log, pairwise, etc.). This effectively quadruples the number of predictors I can assess. Some of these transformed variables could prove to be significant and improve model prediction accuracy. Moreover, I want to include non-basketball game statistic predictors such as the conference each team plays in, where the games are located in proximity to the schools playing, or other outside rankings from popular websites.
+
+### Future Work
+
+Moving foward, I would like to expand to more non-linear techniques. For example, I could use a multilayer perceptron neural net. The high nonlinearity of a neural net could predict some of the upsets that make March Madness famous.
+
+Finally, I hope I can further expand my scope and apply my methodologies to other bracket style tournaments in other sports. This could entail predicting the outcomes of playoff games leading up to NBA Finals, the NFL Superbowl, or the MLB World Series.
+
+***
+
+# Appendix
+## Exploratory Data Analysis
+### Correlogram Analysis
+
+First, I looked at a correlogram. The plot gives a sense of the severity of the multicollinearity issues between different predictors:
+
+``` {r out.width=c('50%', '50%'), fig.show='hold',message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Load Dataset ------------------------------------------------------------
+
+model_data <- read_csv("data/cleaned_data.csv") %>%
+  select(-team_1_name, -team_2_name) %>%
+  select(1:36)
+
+# 33 Predictors
+
+model_data_diff <- read_csv("data/cleaned_data.csv") %>%
+  select(-team_1_name, -team_2_name) %>%
+  select(season, team_1, team_2, win, 37:52) 
+
+# 16 Predictors
+
+model_data %>% 
+  select(-season, -team_1, -team_2) %>%
+  cor() %>% 
+  corrplot()
+
+model_data_diff %>% 
+  select(-season, -team_1, -team_2) %>%
+  cor() %>% 
+  corrplot()
+```
+
+Looking at the plots above, I identified a couple highly correlated predictor pairings. For example, the plots indicated that a team's seeding is directly correlated with their regular season win percentage. Similarly, a team's Effective Field Goal Percentage is also directly correlated with its True Shooting Percentage. Finally, a team’s Offensive Rating is directly correlated with its Effective Field Goal Percentage and True Shooting Percentage. This correlation is intuative because these three statistics are based on one parameter, namely, making the basket.
+
+### Boxplot Analysis
+#### Effective Field Goal Percentage, Turnover Percentage, Total Rebound Percentage
+
+Next, I looked at boxplots of different statistics between teams who won or lost games in the March Madness Tournament. This gave me an initial understanding of what statistics are important in predicting a team winning or losing games. My initial hypothesis was that there are 3 factors that best predict the outcome of a  basketball game: 1) Shooting (Effective Field Goal Percentage), 2) Turnovers (Turnover Percentage), and 3) Rebounding (Total Rebounding Percentage). Intuitively, a team that wins a basketball game is probably better at shooting, turns the ball over less, and rebounds. I also analzyed whether or not these differences, if any exist, are statistically significant. 
+
+``` {r out.width=c('50%', '50%'), fig.show='hold', message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Effective Field Goal Percentage
+model_data %>%
+  ggplot(mapping = aes(x = win, y = team_1_efg_pct, group = win)) +
+  xlab("Win") +
+  ylab("Effective Field Goal Percentage") +
+  ggtitle("Effective Field Goal Percentage by Game Outcome") +
+  geom_boxplot()
+
+# Turnover Percetage
+model_data %>%
+  ggplot(mapping = aes(x = win, y = team_1_to_pct, group = win)) +
+  xlab("Win") +
+  ylab("Turnover Percentage") +
+  ggtitle("Turnover Percentage by Game Outcome") +
+  geom_boxplot()
+```
+
+<center>
+``` {r out.width=c('50%', '50%'), fig.show='hold', message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Total Rebound Percentage
+model_data %>%
+  ggplot(mapping = aes(x = win, y = team_1_trb_pct, group = win)) +
+  xlab("Win") +
+  ylab("Total Rebound Percentage") +
+  ggtitle("Total Rebound Percentage by Game Outcome") +
+  geom_boxplot()
+
+```
+</center>
+
+Looking at the plots above, winning teams have a higher Effective Field Goal Percentage, a lower Turnover Percentage, and a higher Total Rebound Percentage. Moreover, after conducting a t-test, I found that the difference between winning and losing teams is statistically significant at the 1% level among these three predictors. Overall, this confirms my initial hypothesis.
+
+#### Pace, Seeding, Offensive Rating, Defensive Rating
+
+Aside from the three predictors I explored above, I also analyzed some other predictors, most notably Pace (average possessions per game), Seeding, Offensive Rating (the number of points a team scores per 100 possessions), and Defensive Rating (the number of points a team allows per 100 opposing team possessions). My initial hypothesis was that winning teams most likely have higher pace or higher average possessions per game during the regular season. This higher pace may be indicative of a more efficient offense and/or better defense. Regarding Seeding, I expected higher seeded teams to win more often in the March Madness Tournament. Finally, for Offensive and Defensive Rating, I expected March Madness teams that win to have higher Offensive Ratings and lower Defensive Ratings.
+
+``` {r out.width=c('50%', '50%'), fig.show='hold', message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Pace
+model_data %>%
+  ggplot(mapping = aes(x = win, y = team_1_pace, group = win)) +
+  xlab("Win") +
+  ylab("Pace") +
+  ggtitle("Pace by Game Outcome") +
+  geom_boxplot()
+
+# Lets compare seeding to win. Do higher seeds typical win games? 
+model_data %>%
+  ggplot(mapping = aes(x = win, y = team_1_seed, group = win)) +
+  xlab("Win") +
+  ylab("Seed") +
+  ggtitle("Seed by Game Outcome") +
+  geom_boxplot()
+```
+
+Looking at the pace boxplots, contrary to my initial hypothesis, there is not statistically significant difference of pace between winning and losing teams. Overall, what a team does with each possession is, by far, more important than the total number of times a team has the basketball. In other words, a team that wins games usually is able to score the ball on each possession, rather than turning the ball over or missing the shot.
+
+Look at the seeding boxplots, I found a relatively intuitive result: higher seeded teams in the March Madness Tournament tend to win more often. The difference in game outcome by seeding is statistically significant at the 1% level. With this said, it is important to note that, as shown in the boxplots, even the highest seeded teams lose game and the lowest seeded teams can win games. This is the beauty and excitement of March Madness - the highest seeded team doesn't always win and upsets happen! This confirms my initial hypothesis.
+
+
+``` {r out.width=c('50%', '50%'), fig.show='hold', message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+# Winning team probably have more efficient offense (higher number) and defense (lower number)
+model_data %>%
+  ggplot(mapping = aes(x = win, y = team_1_ORtg, group = win)) +
+  xlab("Win") +
+  ylab("Offensive Efficiency") +
+  ggtitle("Offensive Efficiency by Game Outcome") +
+  geom_boxplot()
+
+model_data %>%
+  ggplot(mapping = aes(x = win, y = team_1_DRtg, group = win)) +
+  xlab("Win") +
+  ylab("Defensive Efficiency") +
+  ggtitle("Defensive Efficiency by Game Outcome") +
+  geom_boxplot()
+```
+
+Looking at both the Offensive Rating and Defensive Rating boxplots, teams that win have higher Offensive Ratings and lower Defensive Ratings. These differences are statistically significant at the 1% level. In other words, compared to teams that lose, teams that win typically scoring more per 100 possessions and allow fewer opponent points per 100 opposing team possessions. Overall, on average, winning teams are better offensively and defensively. This confirms my initial hypotheses. 
+
+***
+
+
+
+
+
+
+
+
+
+
+
+
+
+
